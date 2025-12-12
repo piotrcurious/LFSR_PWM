@@ -1,0 +1,638 @@
+// lfsr_viz_signed_fixed_with_filters.cpp
+// Compile:
+// g++ -O3 -std=c++17 -march=native -pthread -o lfsr_viz_signed_fixed_with_filters lfsr_viz_signed_fixed_with_filters.cpp -lSDL2 -lGL
+// (same as original compile line)
+
+#include <SDL2/SDL.h>
+#include <SDL2/SDL_opengl.h>
+#include <GL/gl.h>
+
+#include <iostream>
+#include <vector>
+#include <algorithm>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <fstream>
+#include <cmath>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cstring>
+#include <immintrin.h>
+
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
+const char* DATA_FILE = "lfsr_map_signed.bin";
+const int N_BITS = 16;
+const size_t DIM_SIZE = 1u << N_BITS; // 65536
+const size_t TOTAL_POINTS = DIM_SIZE * DIM_SIZE;
+const size_t FILE_SIZE = TOTAL_POINTS * sizeof(int16_t);
+
+const int WINDOW_WIDTH = 1980;
+const int WINDOW_HEIGHT = 1000;
+const float MAX_DUTY_SCALER = 32767.0f;
+
+// Size of the chunk (in mask/X columns) to process in a single frame
+// when in stationary high-detail mode. This value is GL-accelerated
+// (drawing via glDrawArrays) and can be adjusted for performance vs. draw speed.
+const size_t STATIONARY_CHUNK_SIZE = 128; 
+
+// -----------------------------------------------------------------------------
+// LFSR Logic
+// -----------------------------------------------------------------------------
+static inline uint16_t next_state(uint16_t state, uint16_t mask) {
+    uint16_t feedback = __builtin_parity(state & mask);
+    return (state >> 1) | (feedback << 15);
+}
+
+// -----------------------------------------------------------------------------
+// Data Generation (unchanged)
+// -----------------------------------------------------------------------------
+void generate_dataset_worker(size_t start_mask,
+                             size_t end_mask,
+                             int16_t* buffer,
+                             std::atomic<size_t>& progress,
+                             std::atomic<bool>& error_flag)
+{
+    std::vector<uint8_t> visited(DIM_SIZE, 0);
+    std::vector<uint16_t> chain;
+    chain.reserve(DIM_SIZE);
+
+    std::vector<uint16_t> cycle_sorted;
+    cycle_sorted.reserve(DIM_SIZE);
+
+    for (int m = (int)start_mask; m < (int)end_mask; ++m) {
+        uint16_t mask = (uint16_t)m;
+
+        // clearer & robust: reset visited with std::fill
+        std::fill(visited.begin(), visited.end(), 0);
+
+        uint64_t row_offset = (uint64_t)mask * DIM_SIZE;
+
+        for (int s = 0; s < (int)DIM_SIZE; ++s) {
+            if (visited[s]) continue;
+
+            uint16_t curr = (uint16_t)s;
+            chain.clear();
+
+            // 1) Walk chain (mark visited as we go)
+            while (!visited[curr]) {
+                visited[curr] = 1;
+                chain.push_back(curr);
+                curr = next_state(curr, mask);
+            }
+
+            // 2) Did we discover a new cycle in this chain or merge into an earlier path?
+            auto it = std::find(chain.begin(), chain.end(), curr);
+            bool merges_into_existing = (it == chain.end());
+
+            if (!merges_into_existing) {
+                // New cycle discovered entirely inside this chain
+                size_t cycle_start_idx = std::distance(chain.begin(), it);
+                size_t cycle_len = chain.size() - cycle_start_idx;
+
+                // collect & sort cycle nodes
+                cycle_sorted.clear();
+                for (size_t i = cycle_start_idx; i < chain.size(); ++i) cycle_sorted.push_back(chain[i]);
+                std::sort(cycle_sorted.begin(), cycle_sorted.end());
+
+                // A) assign stable (positive) duties to cycle nodes
+                for (size_t i = 0; i < cycle_sorted.size(); ++i) {
+                    uint16_t st = cycle_sorted[i];
+                    double duty = (double)(cycle_len - i) / (double)cycle_len; // 1.0 .. 1/cycle_len
+                    int32_t dval = (int32_t)std::round(duty * MAX_DUTY_SCALER);
+                    if (dval < 1) dval = 1;
+                    buffer[row_offset + st] = (int16_t)dval; // stable -> positive
+                }
+
+                // B) assign transient (negative) duties for nodes preceding the cycle in chain
+                for (size_t i = 0; i < cycle_start_idx; ++i) {
+                    uint16_t trans_st = chain[i];
+                    auto it_gt = std::upper_bound(cycle_sorted.begin(), cycle_sorted.end(), trans_st);
+                    int count_gt = (int)std::distance(it_gt, cycle_sorted.end());
+                    double duty = (cycle_len > 0) ? (double)count_gt / (double)cycle_len : 0.0;
+                    if (duty <= 0.0) duty = 1.0 / (double)cycle_len;
+                    int32_t sval = (int32_t)std::round(duty * MAX_DUTY_SCALER);
+                    if (sval < 1) sval = 1;
+                    buffer[row_offset + trans_st] = (int16_t)(-sval); // transient -> negative
+                }
+            } else {
+                // Merges into an existing path computed earlier in this mask loop.
+                int16_t target_val = buffer[row_offset + curr];
+                double target_duty = (double)std::abs((double)target_val) / MAX_DUTY_SCALER;
+                if (target_duty <= 0.0) {
+                    target_duty = 1.0 / (double)DIM_SIZE;
+                }
+
+                size_t L = chain.size();
+                for (size_t i = 0; i < L; ++i) {
+                    double frac = ((double)(i + 1)) / (double)L; // 1/L .. 1.0
+                    double duty = target_duty * frac;
+                    int32_t sval = (int32_t)std::round(duty * MAX_DUTY_SCALER);
+                    if (sval < 1) sval = 1;
+                    uint16_t trans_st = chain[i];
+                    buffer[row_offset + trans_st] = (int16_t)(-sval);
+                }
+            }
+        } // end seeds loop
+
+        // explicit atomic increment of progress for each completed mask
+        progress.fetch_add(1, std::memory_order_relaxed);
+    } // end masks loop
+}
+
+// -----------------------------------------------------------------------------
+// ensure_dataset_exists (unchanged logic)
+// -----------------------------------------------------------------------------
+void ensure_dataset_exists() {
+    int fd = open(DATA_FILE, O_RDWR | O_CREAT, 0644);
+    if (fd == -1) { perror("Error opening file"); exit(1); }
+
+    struct stat st;
+    fstat(fd, &st);
+
+    if ((size_t)st.st_size == FILE_SIZE) {
+        std::cout << "[INFO] Dataset " << DATA_FILE << " found. Ready.\n";
+        close(fd);
+        return;
+    }
+
+    std::cout << "[INFO] Generating dataset (" << (FILE_SIZE/(1024ull*1024ull*1024ull)) << " GB) ... Please wait.\n";
+    if (ftruncate(fd, FILE_SIZE) == -1) { perror("ftruncate"); exit(1); }
+
+    int16_t* map = (int16_t*)mmap(nullptr, FILE_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) { perror("mmap"); exit(1); }
+
+    // Initialize to zero
+    std::cout << "[INFO] Initializing memory...\n";
+    memset(map, 0, FILE_SIZE);
+
+    int num_threads = std::thread::hardware_concurrency();
+    if (num_threads <= 0) num_threads = 4;
+
+    std::vector<std::thread> threads;
+    std::atomic<size_t> progress{0};
+    std::atomic<bool> error_flag{false};
+
+    size_t chunk = DIM_SIZE / (size_t)num_threads;
+
+    std::cout << "[INFO] Using " << num_threads << " threads\n";
+
+    for (int t = 0; t < num_threads; ++t) {
+        size_t start = (size_t)t * chunk;
+        size_t end = (t == num_threads - 1) ? DIM_SIZE : (size_t)(t + 1) * chunk;
+        threads.emplace_back(generate_dataset_worker,
+                             start,
+                             end,
+                             map,
+                             std::ref(progress),
+                             std::ref(error_flag));
+    }
+
+    // Progress monitoring with timeout detection
+    size_t last_progress = 0;
+    int stall_count = 0;
+    const int MAX_STALLS = 30; // 30 seconds without progress = error
+
+    while (progress.load(std::memory_order_relaxed) < DIM_SIZE) {
+        if (error_flag.load(std::memory_order_relaxed)) {
+            std::cerr << "[ERROR] Worker thread encountered error. Aborting.\n";
+            for (auto& th : threads) {
+                if (th.joinable()) th.join();
+            }
+            munmap(map, FILE_SIZE);
+            close(fd);
+            exit(1);
+        }
+
+        size_t p = progress.load(std::memory_order_relaxed);
+      
+        if (p == last_progress) {
+            stall_count++;
+            if (stall_count >= MAX_STALLS) {
+                std::cerr << "\n[ERROR] Generation stalled at " << p << "/" << DIM_SIZE << "\n";
+                error_flag.store(true);
+                break;
+            }
+        } else {
+            stall_count = 0;
+            last_progress = p;
+        }
+
+        if (p % 100 == 0 || p == last_progress + 10) {
+            printf("\r[Generating] %zu / %zu Masks (%.3f%%)    ",
+                   p, DIM_SIZE, (p * 100.0f) / (double)DIM_SIZE);
+            fflush(stdout);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    for (auto& th : threads) {
+        if (th.joinable()) th.join();
+    }
+
+    if (error_flag.load()) {
+        std::cout << "\n[FAILED] Generation failed.\n";
+        munmap(map, FILE_SIZE);
+        close(fd);
+        exit(1);
+    }
+
+    std::cout << "\n[DONE] Generation complete.\n";
+
+    munmap(map, FILE_SIZE);
+    close(fd);
+}
+
+// -----------------------------------------------------------------------------
+// Visualization + UI controls for filtering
+// -----------------------------------------------------------------------------
+struct Camera {
+    float x = 32768.0f; 
+    float y = 32768.0f;
+    float dist = 70000.0f;
+    float pitch = 45.0f;
+    float yaw = 0.0f;
+};
+
+void draw_text(float x, float y, const std::string& text) {
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix(); glLoadIdentity();
+    glOrtho(0, WINDOW_WIDTH, WINDOW_HEIGHT, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix(); glLoadIdentity();
+    glLineWidth(2.0f);
+    glColor3f(1.0f, 1.0f, 1.0f);
+    float cx = x; float scale = 10.0f;
+    for(char c : text) {
+        glBegin(GL_LINES);
+        float w = 0.6f * scale, h = 1.0f * scale;
+        if (c == ' ') { cx += w + 4; glEnd(); continue; }
+        bool t=0,m=0,b=0,tl=0,tr=0,bl=0,br=0;
+        if(isdigit(c)) {
+            int d = c-'0';
+            if(d!=1 && d!=4) t=1; if(d!=0 && d!=1 && d!=7) m=1; if(d!=1 && d!=4 && d!=7) b=1;
+            if(d!=1 && d!=2 && d!=3 && d!=7) tl=1; if(d!=5 && d!=6) tr=1;
+            if(d==0 || d==2 || d==6 || d==8) bl=1; if(d!=2) br=1;
+        } else if(c=='-') m=1;
+        else if(c=='S') {t=1;m=1;b=1;tl=1;br=1;}
+        else if(c=='T') {t=1; glVertex2f(cx+w/2,y); glVertex2f(cx+w/2,y+h); }
+        else { t=b=tl=tr=bl=br=1; }
+        
+        if(t) {glVertex2f(cx,y); glVertex2f(cx+w,y);}
+        if(m) {glVertex2f(cx,y+h/2); glVertex2f(cx+w,y+h/2);}
+        if(b) {glVertex2f(cx,y+h); glVertex2f(cx+w,y+h);}
+        if(tl){glVertex2f(cx,y); glVertex2f(cx,y+h/2);}
+        if(bl){glVertex2f(cx,y+h/2); glVertex2f(cx,y+h);}
+        if(tr){glVertex2f(cx+w,y); glVertex2f(cx+w,y+h/2);}
+        if(br){glVertex2f(cx+w,y+h/2); glVertex2f(cx+w,y+h);}
+        glEnd();
+        cx += w + 6.0f;
+    }
+    glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
+}
+
+int main(int argc, char** argv) {
+    ensure_dataset_exists();
+
+    int fd = open(DATA_FILE, O_RDONLY);
+    if (fd == -1) { perror("Error opening data file"); return 1; }
+    
+    int16_t* data = (int16_t*)mmap(nullptr, FILE_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+    if (data == MAP_FAILED) { perror("mmap failed"); return 1; }
+
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        std::cerr << "SDL_Init failed: " << SDL_GetError() << "\n";
+        return 1;
+    }
+    
+    SDL_GL_SetAttribute(SDL_GL_MULTISAMPLEBUFFERS, 1);
+    SDL_GL_SetAttribute(SDL_GL_MULTISAMPLESAMPLES, 4);
+
+    SDL_Window* window = SDL_CreateWindow("LFSR Map (Signed Transients) - Filters Enabled", 
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, WINDOW_WIDTH, WINDOW_HEIGHT, 
+        SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
+    
+    if (!window) {
+        std::cerr << "Window creation failed: " << SDL_GetError() << "\n";
+        return 1;
+    }
+    
+    SDL_GLContext context = SDL_GL_CreateContext(window);
+    if (!context) {
+        std::cerr << "GL context creation failed: " << SDL_GetError() << "\n";
+        return 1;
+    }
+
+    glEnable(GL_DEPTH_TEST);
+
+    Camera cam;
+    bool running = true;
+    float vel_yaw=0, vel_pitch=0, vel_x=0, vel_y=0;
+    bool drag_rot=false, drag_pan=false;
+    int last_mx=0, last_my=0;
+
+    // --- State variables for Stationary Mode ---
+    bool is_moving = true;
+    // Tracks the current starting mask (X-coordinate offset from min_x) for high-detail chunk drawing
+    size_t stationary_progress_x = 0;
+    const float STATIONARY_THRESHOLD = 0.001f;
+
+    // Filtering / UI state
+    bool show_transients = true;
+    bool show_stable = true;
+    bool show_lockups = true;
+    float min_duty = 0.0f; // 0.0 .. 1.0
+    float max_duty = 1.0f; // 0.0 .. 1.0
+    bool show_help = true;
+
+    struct Vertex { float x, y, z; uint8_t r, g, b, a; };
+    std::vector<Vertex> vbuffer;
+    vbuffer.reserve(1000000);
+
+    while (running) {
+        SDL_Event e;
+        while (SDL_PollEvent(&e)) {
+            if (e.type == SDL_QUIT) running = false;
+            else if (e.type == SDL_MOUSEBUTTONDOWN) {
+                if (e.button.button == SDL_BUTTON_LEFT) drag_rot = true;
+                if (e.button.button == SDL_BUTTON_RIGHT) drag_pan = true;
+            }
+            else if (e.type == SDL_MOUSEBUTTONUP) { drag_rot = false; drag_pan = false; }
+            else if (e.type == SDL_MOUSEMOTION) {
+                int dx = e.motion.x - last_mx; int dy = e.motion.y - last_my;
+                last_mx = e.motion.x; last_my = e.motion.y;
+                if (drag_rot) { vel_yaw += dx*0.5f; vel_pitch += dy*0.5f; }
+                if (drag_pan) {
+                    float rad = cam.yaw * 3.14159f / 180.0f;
+                    // Pan on XY plane relative to camera view
+                    vel_x -= (cos(rad)*dx - sin(rad)*dy) * (cam.dist * 0.001f);
+                    vel_y -= (sin(rad)*dx + cos(rad)*dy) * (cam.dist * 0.001f);
+                }
+            }
+            else if (e.type == SDL_MOUSEWHEEL) {
+                // Zoom affects distance
+                cam.dist -= e.wheel.y * (cam.dist * 0.1f);
+                if (cam.dist < 100) cam.dist = 100;
+            }
+            else if (e.type == SDL_KEYDOWN) {
+                // Any filter/UI change should be treated as movement until rendered
+                is_moving = true; 
+                SDL_Keycode kc = e.key.keysym.sym;
+                const float step_duty = 0.01f; // 1% increments
+
+                if (kc == SDLK_ESCAPE) running = false;
+                else if (kc == SDLK_t) show_transients = !show_transients;
+                else if (kc == SDLK_s) show_stable = !show_stable;
+                else if (kc == SDLK_l) show_lockups = !show_lockups;
+                else if (kc == SDLK_h) show_help = !show_help;
+                else if (kc == SDLK_r) { // reset filters
+                    min_duty = 0.0f; max_duty = 1.0f;
+                    show_transients = show_stable = show_lockups = true;
+                }
+                else if (kc == SDLK_LEFT) {
+                    min_duty = std::max(0.0f, min_duty - step_duty);
+                    if (min_duty > max_duty) min_duty = max_duty;
+                }
+                else if (kc == SDLK_RIGHT) {
+                    min_duty = std::min(1.0f, min_duty + step_duty);
+                    if (min_duty > max_duty) min_duty = max_duty;
+                }
+                else if (kc == SDLK_DOWN) {
+                    max_duty = std::max(0.0f, max_duty - step_duty);
+                    if (max_duty < min_duty) max_duty = min_duty;
+                }
+                else if (kc == SDLK_UP) {
+                    max_duty = std::min(1.0f, max_duty + step_duty);
+                    if (max_duty < min_duty) max_duty = min_duty;
+                }
+            }
+        }
+        
+        // --- Camera Movement and Inertia ---
+        cam.yaw += vel_yaw * 0.1f; cam.pitch += vel_pitch * 0.1f;
+        cam.x += vel_x * 0.1f; cam.y += vel_y * 0.1f;
+        
+        // Apply inertia decay
+        vel_yaw *= 0.9f; vel_pitch *= 0.9f; vel_x *= 0.9f; vel_y *= 0.9f;
+        if (cam.pitch > 89) cam.pitch = 89; if (cam.pitch < -89) cam.pitch = -89;
+
+        // --- State Transition Logic ---
+        float speed = sqrt(vel_yaw*vel_yaw + vel_pitch*vel_pitch + vel_x*vel_x + vel_y*vel_y);
+        int subsampling_step; // The aggressive step for moving or initial stationary view
+
+        if (speed < STATIONARY_THRESHOLD) {
+            // Lock the inertia
+            vel_yaw = 0; vel_pitch = 0; vel_x = 0; vel_y = 0;
+            
+            if (is_moving) {
+                // Transitioned from moving to stationary
+                is_moving = false;
+                stationary_progress_x = 0; // Reset progress for a full high-detail render
+                // std::cout << "[INFO] Entered stationary mode. Starting high-detail draw...\n";
+            }
+            
+            // Stationary subsampling based on distance
+            subsampling_step = (cam.dist > 30000 ? 32 : (cam.dist > 10000 ? 8 : (cam.dist > 2000 ? 4 : 1)));
+
+        } else {
+            // Moving or just started moving
+            if (!is_moving) {
+                // std::cout << "[INFO] Exited stationary mode. Fast subsampling active.\n";
+            }
+            is_moving = true;
+            stationary_progress_x = 0; // Ensure progress is reset on movement
+
+            if (speed > 1.0f) { subsampling_step = 128; } else if (speed > 0.1f) { subsampling_step = 32; } else {
+                subsampling_step = (cam.dist > 30000 ? 64 : (cam.dist > 10000 ? 16 : (cam.dist > 2000 ? 4 : 1)));
+            }
+        }
+
+        // --- OpenGL Setup ---
+        glClearColor(0.1f, 0.1f, 0.12f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glMatrixMode(GL_PROJECTION); glLoadIdentity();
+        double ar = (double)WINDOW_WIDTH/WINDOW_HEIGHT;
+        double zn=10.0, zf=500000.0, fov=60.0;
+        double fh = tan(fov/360*3.14159)*zn;
+        glFrustum(-fh*ar, fh*ar, -fh, fh, zn, zf);
+
+        glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+        glTranslatef(0,0,-cam.dist);
+        glRotatef(cam.pitch, 1,0,0);
+        glRotatef(cam.yaw, 0,1,0);
+        glTranslatef(-cam.x, 0, -cam.y);
+
+        // --- View Frustum Calculation ---
+        float range = cam.dist * 1.5f;
+        int min_x = std::max(0, (int)(cam.x - range)); 
+        int max_x = std::min((int)DIM_SIZE, (int)(cam.x + range));
+        int min_y = std::max(0, (int)(cam.y - range)); 
+        int max_y = std::min((int)DIM_SIZE, (int)(cam.y + range));
+
+        // --- Progressive Stationary Drawing Bounds ---
+        int draw_start_x = min_x;
+        int draw_end_x = max_x;
+        int draw_step = subsampling_step; // Default to subsampled drawing
+        
+        int total_x_range = max_x - min_x;
+        int current_progress = 0; // for UI display
+
+        if (!is_moving) {
+            // We are stationary: draw a small chunk at full detail (step=1)
+            draw_step = 1;
+            
+            // Define the chunk boundary for X (masks) based on progress
+            draw_start_x = min_x + (int)stationary_progress_x;
+            draw_end_x = std::min(max_x, draw_start_x + (int)STATIONARY_CHUNK_SIZE);
+            
+            current_progress = draw_start_x - min_x;
+            
+            if (draw_start_x >= max_x) {
+                // Completed the high-detail pass for the visible area.
+                stationary_progress_x = 0; // Reset progress for the next frame
+                draw_end_x = draw_start_x; // Draw nothing on this pass, the whole view is done
+                // Note: The low-detail draw from the 'subsampling_step' still covers the area.
+            } else {
+                // Update progress for the next frame
+                stationary_progress_x += STATIONARY_CHUNK_SIZE;
+            }
+        } else {
+             // Moving: draw the entire visible area aggressively subsampled
+             draw_start_x = min_x;
+             draw_end_x = max_x;
+             draw_step = subsampling_step;
+        }
+
+        vbuffer.clear();
+        glEnableClientState(GL_VERTEX_ARRAY);
+        glEnableClientState(GL_COLOR_ARRAY);
+
+        // --- The Drawing Loop ---
+        for (int mx = draw_start_x; mx < draw_end_x; mx += draw_step) {
+            for (int my = min_y; my < max_y; my += draw_step) {
+                int16_t val = data[mx * DIM_SIZE + my];
+                
+                bool is_transient = (val < 0);
+                float abs_norm = std::abs(val) / MAX_DUTY_SCALER;
+                float z = abs_norm * 10000.0f;
+
+                // --- Filtering logic: skip points according to UI state ---
+                // 1) type filtering
+                if (is_transient && !show_transients) continue;
+                if (!is_transient && !show_stable) continue;
+                
+                // check lockup condition separately: if lockups are disabled, skip them
+                uint16_t ns = next_state((uint16_t)my, (uint16_t)mx);
+                bool is_lockup = (ns == (uint16_t)my);
+                if (is_lockup && !show_lockups) continue;
+
+                // 2) duty range filtering
+                if (abs_norm < min_duty) continue;
+                if (abs_norm > max_duty) continue;
+                // ----------------------------------------------------------------
+
+                uint8_t r, g, b;
+
+                if (is_lockup) {
+                    r = 0; g = 255; b = 255;
+                    vbuffer.push_back({(float)mx, z, (float)my, r, g, b, 255});
+                    // Draw a small line for emphasis when subsampling is coarse
+                    if (draw_step > 1) {
+                         vbuffer.push_back({(float)mx, z+50, (float)my, r, g, b, 255});
+                         vbuffer.push_back({(float)mx, z+100, (float)my, r, g, b, 255});
+                    }
+                } 
+                else if (is_transient) {
+                    r = (uint8_t)(50 + abs_norm * 100);
+                    g = (uint8_t)(50 + abs_norm * 100);
+                    b = (uint8_t)(70 + abs_norm * 140);
+                    vbuffer.push_back({(float)mx, z, (float)my, r, g, b, 255});
+                } 
+                else {
+                    r = (uint8_t)(abs_norm * 255);
+                    g = (uint8_t)(sin(abs_norm * 3.14159) * 255);
+                    b = (uint8_t)((1.0f - abs_norm) * 50);
+                    vbuffer.push_back({(float)mx, z, (float)my, r, g, b, 255});
+                }
+
+                if (vbuffer.size() >= 999000) {
+                    glVertexPointer(3, GL_FLOAT, sizeof(Vertex), &vbuffer[0].x);
+                    glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(Vertex), &vbuffer[0].r);
+                    glDrawArrays(GL_POINTS, 0, (GLsizei)vbuffer.size());
+                    vbuffer.clear();
+                }
+            }
+        }
+        
+        // Draw any remaining points in the buffer
+        if (!vbuffer.empty()) {
+            glVertexPointer(3, GL_FLOAT, sizeof(Vertex), &vbuffer[0].x);
+            glColorPointer(4, GL_UNSIGNED_BYTE, sizeof(Vertex), &vbuffer[0].r);
+            glDrawArrays(GL_POINTS, 0, (GLsizei)vbuffer.size());
+        }
+
+        glDisableClientState(GL_VERTEX_ARRAY);
+        glDisableClientState(GL_COLOR_ARRAY);
+
+        // --- UI / Status Text ---
+
+        int hover_mask = std::clamp((int)cam.x, 0, 65535);
+        int hover_seed = std::clamp((int)cam.y, 0, 65535);
+        int16_t h_val = data[hover_mask * DIM_SIZE + hover_seed];
+        float h_duty = std::abs(h_val) / MAX_DUTY_SCALER;
+        
+        std::string s_type = (h_val < 0) ? "TRANSIENT" : "STABLE";
+        if (next_state(hover_seed, hover_mask) == hover_seed) s_type = "LOCKUP";
+
+        std::string s_mode;
+        std::string s_prog_text = "";
+        if (is_moving) {
+            s_mode = "MOVING (Aggressive Subsampling)";
+            s_prog_text = "Step: " + std::to_string(draw_step);
+        } else {
+            s_mode = "STATIONARY (Progressive Detail)";
+            if (total_x_range > 0 && current_progress < total_x_range) {
+                 s_prog_text = "Step: 1 | Progress: " + std::to_string(current_progress) + "/" + std::to_string(total_x_range);
+            } else {
+                 s_prog_text = "Step: 1 | Complete";
+            }
+        }
+
+        // Draw status lines + help
+        draw_text(20, 20, "VIEW MODE: " + s_mode + " | " + s_prog_text);
+        draw_text(20, WINDOW_HEIGHT-20, "Press H for help | T:toggle transients | S:toggle stables | L:toggle lockups");
+        draw_text(20, WINDOW_HEIGHT-40, "Duty range: min=" + std::to_string((int)(min_duty*100)) + "% max=" + std::to_string((int)(max_duty*100)) + "%    [LEFT/RIGHT adjust min, DOWN/UP adjust max]");
+
+        draw_text(20, WINDOW_HEIGHT-60, "MASK: " + std::to_string(hover_mask) + " SEED: " + std::to_string(hover_seed));
+        draw_text(20, WINDOW_HEIGHT-80, "TYPE: " + s_type + "  DUTY: " + std::to_string((int)(h_duty*100)) + " " + std::to_string(h_duty));
+
+        if (show_help) {
+            const int H0 = 120;
+            draw_text(20, H0 + 0,  "HELP:");
+            draw_text(20, H0 + 20, "  T - toggle TRANSIENTS (negative values)");
+            draw_text(20, H0 + 40, "  S - toggle STABLES (positive cycle nodes)");
+            draw_text(20, H0 + 60, "  L - toggle LOCKUPS (ns == seed)");
+            draw_text(20, H0 + 80, "  LEFT/RIGHT - decrease/increase MIN DUTY by 1%");
+            draw_text(20, H0 + 100,"  DOWN/UP - decrease/increase MAX DUTY by 1%");
+            draw_text(20, H0 + 120,"  R - reset filters (show all)");
+            draw_text(20, H0 + 140,"  H - hide/show this help");
+            draw_text(20, H0 + 160,"  LMB Drag - Rotate Camera");
+            draw_text(20, H0 + 180,"  RMB Drag - Pan Camera");
+            draw_text(20, H0 + 200,"  Mouse Wheel - Zoom");
+        }
+
+        SDL_GL_SwapWindow(window);
+    }
+
+    munmap(data, FILE_SIZE);
+    close(fd);
+    SDL_GL_DeleteContext(context);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return 0;
+}
