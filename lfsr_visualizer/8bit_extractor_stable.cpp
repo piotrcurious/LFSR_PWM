@@ -15,6 +15,7 @@
 #include <cerrno>
 #include <cstdint>
 #include <chrono>
+#include <cstdint> // for int16_t
 
 // -----------------------------------------------------------------------------
 // Configuration
@@ -81,60 +82,68 @@ void prepare_output_files() {
 // -----------------------------------------------------------------------------
 // Worker
 // -----------------------------------------------------------------------------
-void worker(uint32_t start_mask,
-            uint32_t end_mask,
-            const int16_t* input,
-            std::atomic<uint64_t>& progress)
-{
-    std::vector<Entry> buffers[256];
-    for (auto& b : buffers) b.reserve(WRITE_BUFFER_SIZE + 64);
 
-    uint64_t local = 0;
+// --- inside top-of-file includes add:
+#include <cstdint> // for int16_t
+
+// --- Worker (replace previous worker implementation) ---
+void worker(uint32_t start_mask, uint32_t end_mask, const int16_t* input_map, std::atomic<uint64_t>& processed_count) {
+    std::vector<Entry> buffers[256];
+    for (int i = 0; i < 256; ++i) buffers[i].reserve(WRITE_BUFFER_SIZE + 100);
+
+    uint64_t local_count = 0;
 
     for (uint32_t m = start_mask; m < end_mask; ++m) {
-        uint64_t row = uint64_t(m) * DIM_SIZE;
+        uint64_t row_offset = (uint64_t)m * (uint64_t)DIM_SIZE;
 
         for (uint32_t s = 0; s < DIM_SIZE; ++s) {
-            int16_t v = input[row + s];
+            // Read signed 16-bit value
+            int16_t val = input_map[row_offset + s];
 
-            // Signed [-32768 .. 32767] → [0 .. 255]
-            uint32_t norm =
-                static_cast<uint32_t>(int(v) + 32768) * 255u / 65535u;
+            // Skip non-positive values (unstable LFSRs)
+            if (val <= 0) {
+                continue;
+            }
 
-            uint8_t pwm8 = static_cast<uint8_t>(norm);
+            // Quantize to 8-bit using same mapping used earlier (signed -> 0..255)
+            // normalized = (val + 32768) / 65535    (val is positive here so result > 0.5 typically)
+//            uint8_t pwm8 = static_cast<uint8_t>((static_cast<uint32_t>(static_cast<int32_t>(val) + 32768) * 255u) / 65535u);
+            uint8_t pwm8 = static_cast<uint8_t>((static_cast<uint32_t>(static_cast<int32_t>(val)) * 255u) / 32767u);
 
-            buffers[pwm8].push_back({uint16_t(m), uint16_t(s)});
+            buffers[pwm8].push_back({static_cast<uint16_t>(m), static_cast<uint16_t>(s)});
 
             if (buffers[pwm8].size() >= WRITE_BUFFER_SIZE) {
                 std::lock_guard<std::mutex> lock(file_mutexes[pwm8]);
-                if (full_write(out_fds[pwm8],
-                               buffers[pwm8].data(),
-                               buffers[pwm8].size() * sizeof(Entry)) < 0) {
+                size_t bytes = buffers[pwm8].size() * sizeof(Entry);
+                if (full_write(out_fds[pwm8], buffers[pwm8].data(), bytes) == -1) {
                     perror("write");
-                    exit(1);
+                    std::exit(1);
                 }
                 buffers[pwm8].clear();
             }
         }
 
-        local += DIM_SIZE;
-        if (local >= DIM_SIZE * 16) {
-            progress.fetch_add(local, std::memory_order_relaxed);
-            local = 0;
+        local_count += DIM_SIZE;
+        if (local_count >= DIM_SIZE * 16) {
+            processed_count.fetch_add(local_count, std::memory_order_relaxed);
+            local_count = 0;
         }
     }
 
+    // flush remaining
     for (int i = 0; i < 256; ++i) {
         if (!buffers[i].empty()) {
             std::lock_guard<std::mutex> lock(file_mutexes[i]);
-            full_write(out_fds[i],
-                       buffers[i].data(),
-                       buffers[i].size() * sizeof(Entry));
+            size_t bytes = buffers[i].size() * sizeof(Entry);
+            if (full_write(out_fds[i], buffers[i].data(), bytes) == -1) {
+                perror("write");
+                std::exit(1);
+            }
+            buffers[i].clear();
         }
     }
 
-    if (local)
-        progress.fetch_add(local, std::memory_order_relaxed);
+    if (local_count) processed_count.fetch_add(local_count, std::memory_order_relaxed);
 }
 
 // -----------------------------------------------------------------------------
