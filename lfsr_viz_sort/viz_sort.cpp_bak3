@@ -1,0 +1,1004 @@
+// lfsr_analytics_viz.cpp
+//
+// Compile: g++ -O3 -std=c++17 -march=native -o lfsr_analytics_viz lfsr_analytics_viz.cpp -lfltk -lfltk_gl -lGL -lGLU -lpthread
+
+#include <FL/Fl.H>
+#include <FL/Fl_Gl_Window.H>
+#include <FL/Fl_Double_Window.H>
+#include <FL/Fl_Check_Browser.H>
+#include <FL/Fl_Button.H>
+#include <FL/Fl_Group.H>
+#include <FL/Fl_Box.H>
+#include <FL/Fl_Tabs.H>
+#include <FL/gl.h>
+#include <GL/glu.h>
+
+#include <iostream>
+#include <vector>
+#include <string>
+#include <cmath>
+#include <fstream>
+#include <algorithm>
+#include <iomanip>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <condition_variable>
+#include <array>
+
+// -----------------------------------------------------------------------------
+// Data Structures
+// -----------------------------------------------------------------------------
+struct Point2D {
+    uint16_t mask;
+    uint16_t seed;
+};
+
+struct BinData {
+    int id = -1;
+    std::vector<Point2D> points;
+    bool visible = false;
+    float r = 1.0f, g = 1.0f, b = 1.0f;
+};
+
+// Per-LFSR evaluation result (derived from Point2D)
+struct EvalResult {
+    Point2D p;
+    int bin_id = -1;
+    std::array<int,8> section_counts{};
+    int total_on = 0;
+    double symmetry_score = 0.0; // variance of 8 section counts
+};
+
+// Globals
+static std::vector<BinData> g_bins(256);
+static std::vector<std::vector<EvalResult>> g_eval_by_bin(256);
+static std::mutex g_data_mutex;
+
+// Statistics
+struct Stats {
+    size_t total_points = 0;
+    double avg_mask = 0;
+    double avg_seed = 0;
+    double density = 0;
+    int visible_bins = 0;
+};
+static Stats g_stats;
+
+// Threading / evaluation control
+static std::atomic<bool> g_eval_running(false);
+static std::atomic<bool> g_eval_request_abort(false);
+static std::atomic<bool> g_eval_done_flag(false);
+static std::thread g_eval_thread;
+static std::atomic<size_t> g_eval_total_work(0);
+static std::atomic<size_t> g_eval_done_work(0);
+
+// Sorting control
+static std::atomic<bool> g_sorting(false);
+static std::atomic<bool> g_stop_sort(false);
+
+// -----------------------------------------------------------------------------
+// Helper Functions
+// -----------------------------------------------------------------------------
+void get_color(int id, float& r, float& g, float& b) {
+    float t = id / 255.0f;
+    r = t;
+    g = std::sin(t * 3.14159265f);
+    b = 1.0f - t;
+}
+
+// parity16: parity of 16-bit value (0 or 1)
+static inline uint16_t parity16(uint16_t x) {
+    x ^= x >> 8;
+    x ^= x >> 4;
+    x ^= x >> 2;
+    x ^= x >> 1;
+    return x & 1;
+}
+
+// Load bin from file
+void load_bin(int id) {
+    if (!g_bins[id].points.empty()) return;
+
+    char filename[128];
+    std::snprintf(filename, sizeof(filename), "8bit_set/0x%02X.bin", id);
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open '" << filename << "'\n";
+        return;
+    }
+    std::streamsize size = file.tellg();
+    if (size <= 0) {
+        std::cerr << "Empty file '" << filename << "'\n";
+        return;
+    }
+    if (size % sizeof(Point2D) != 0) {
+        std::cerr << "File size not multiple of Point2D for '" << filename << "'\n";
+        return;
+    }
+    file.seekg(0, std::ios::beg);
+    size_t count = static_cast<size_t>(size / sizeof(Point2D));
+    std::vector<Point2D> tmp(count);
+    if (!file.read(reinterpret_cast<char*>(tmp.data()), size)) {
+        std::cerr << "Failed read for '" << filename << "'\n";
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_data_mutex);
+        g_bins[id].points = std::move(tmp);
+        g_bins[id].id = id;
+        get_color(id, g_bins[id].r, g_bins[id].g, g_bins[id].b);
+    }
+}
+
+// Unload bin
+void unload_bin(int id) {
+    std::lock_guard<std::mutex> lock(g_data_mutex);
+    std::vector<Point2D>().swap(g_bins[id].points);
+    g_eval_by_bin[id].clear();
+    g_bins[id].visible = false;
+}
+
+// Update stats (scans visible bins)
+void update_stats() {
+    size_t count = 0;
+    double sum_m = 0.0;
+    double sum_s = 0.0;
+    int bins = 0;
+
+    for (int i = 0; i < 256; ++i) {
+        std::lock_guard<std::mutex> lock(g_data_mutex);
+        if (g_bins[i].visible && !g_bins[i].points.empty()) {
+            const auto &pts = g_bins[i].points;
+            size_t n = pts.size();
+            count += n;
+            bins++;
+            size_t step = std::max<size_t>(1, n / 100);
+            size_t sampled = 0;
+            double local_sum_m = 0.0;
+            double local_sum_s = 0.0;
+            for (size_t k = 0; k < n; k += step) {
+                local_sum_m += pts[k].mask;
+                local_sum_s += pts[k].seed;
+                sampled++;
+            }
+            if (sampled > 0) {
+                double scale = static_cast<double>(n) / static_cast<double>(sampled);
+                sum_m += local_sum_m * scale;
+                sum_s += local_sum_s * scale;
+            }
+        }
+    }
+
+    g_stats.total_points = count;
+    g_stats.visible_bins = bins;
+    g_stats.avg_mask = (count > 0) ? (sum_m / static_cast<double>(count)) : 0.0;
+    g_stats.avg_seed = (count > 0) ? (sum_s / static_cast<double>(count)) : 0.0;
+    g_stats.density = (count > 0) ? (static_cast<double>(count) / (65536.0 * 65536.0) * 100.0) : 0.0;
+}
+
+// Save all bins to files
+void save_all_bins() {
+    std::lock_guard<std::mutex> lock(g_data_mutex);
+    for (int id = 0; id < 256; ++id) {
+        if (g_bins[id].points.empty()) continue;
+        char filename[128];
+        std::snprintf(filename, sizeof(filename), "8bit_set/0x%02X.bin", id);
+        std::ofstream out(filename, std::ios::binary | std::ios::trunc);
+        if (!out.is_open()) {
+            std::cerr << "Failed to open for write: " << filename << "\n";
+            continue;
+        }
+        out.write(reinterpret_cast<const char*>(g_bins[id].points.data()),
+                  static_cast<std::streamsize>(g_bins[id].points.size() * sizeof(Point2D)));
+        out.close();
+        std::cerr << "Saved bin " << id << " (" << g_bins[id].points.size() << " pts) -> " << filename << "\n";
+    }
+}
+
+// -----------------------------------------------------------------------------
+// LFSR Evaluation
+// -----------------------------------------------------------------------------
+
+// Evaluate a single Point2D over N=65535 cycles and return EvalResult.
+// Uses "seed doubling as threshold" and given LFSR advance rule.
+EvalResult evaluate_point(const Point2D &p, int bin_id) {
+    EvalResult er;
+    er.p = p;
+    er.bin_id = bin_id;
+    er.section_counts.fill(0);
+    er.total_on = 0;
+
+    const uint32_t N = 65535u;
+    uint16_t lfsr_state = p.seed;
+    uint16_t lfsr_mask_current = p.mask;
+    uint32_t threshold = static_cast<uint32_t>(p.seed) * 2u;
+
+    for (uint32_t i = 0; i < N; ++i) {
+        int out = (static_cast<uint32_t>(lfsr_state) > threshold) ? 1 : 0;
+        if (out) {
+            er.total_on++;
+            int section = static_cast<int>((i * 8u) / N);
+            if (section < 0) section = 0;
+            if (section > 7) section = 7;
+            er.section_counts[section]++;
+        }
+        uint16_t feedback = parity16(static_cast<uint16_t>(lfsr_state & lfsr_mask_current));
+        lfsr_state = static_cast<uint16_t>((lfsr_state >> 1) | (feedback << 15));
+    }
+
+    // symmetry score = variance of section counts (lower => more symmetric)
+    double mean = 0.0;
+    for (int k = 0; k < 8; ++k) mean += static_cast<double>(er.section_counts[k]);
+    mean /= 8.0;
+    double var = 0.0;
+    for (int k = 0; k < 8; ++k) {
+        double d = static_cast<double>(er.section_counts[k]) - mean;
+        var += d * d;
+    }
+    var /= 8.0;
+    er.symmetry_score = var;
+    return er;
+}
+
+// Background worker that evaluates all loaded bins.
+// It does not call FLTK APIs. It uses local storage and swaps into globals under lock.
+void evaluate_worker_background() {
+    std::cerr << "[Eval] Worker started\n";
+    // Snapshot visible bins and sizes
+    std::array<bool,256> visible{};
+    std::array<size_t,256> sizes{};
+    {
+        std::lock_guard<std::mutex> lock(g_data_mutex);
+        for (int b = 0; b < 256; ++b) {
+            visible[b] = g_bins[b].visible && !g_bins[b].points.empty();
+            sizes[b] = g_bins[b].points.size();
+        }
+    }
+
+    // compute total work
+    size_t total_work = 0;
+    for (int b = 0; b < 256; ++b) if (visible[b]) total_work += sizes[b];
+    g_eval_total_work.store(total_work);
+    g_eval_done_work.store(0);
+
+    // local evaluation storage
+    std::vector<std::vector<EvalResult>> local_eval(256);
+
+    for (int b = 0; b < 256; ++b) {
+        if (!visible[b]) continue;
+
+        // copy points locally under lock (fast snapshot)
+        std::vector<Point2D> local_points;
+        {
+            std::lock_guard<std::mutex> lock(g_data_mutex);
+            local_points = g_bins[b].points; // copy
+        }
+
+        local_eval[b].reserve(local_points.size());
+        for (size_t i = 0; i < local_points.size(); ++i) {
+            if (g_eval_request_abort.load()) {
+                std::cerr << "[Eval] Abort requested\n";
+                goto eval_abort;
+            }
+            EvalResult er = evaluate_point(local_points[i], b);
+            local_eval[b].push_back(std::move(er));
+            // update progress
+            g_eval_done_work.fetch_add(1);
+            if ((i & 4095) == 0) std::cerr << "."; // coarse progress trace
+        }
+        std::cerr << "\n[Eval] Bin " << b << " evaluated (" << local_eval[b].size() << " pts)\n";
+    }
+
+eval_abort:
+    // Swap local_eval into global g_eval_by_bin under short lock
+    {
+        std::lock_guard<std::mutex> lock(g_data_mutex);
+        for (int b = 0; b < 256; ++b) {
+            g_eval_by_bin[b].clear();
+            if (!local_eval[b].empty()) {
+                g_eval_by_bin[b] = std::move(local_eval[b]);
+            }
+        }
+    }
+
+    g_eval_done_flag.store(true);
+    g_eval_running.store(false);
+    g_eval_request_abort.store(false);
+    std::cerr << "[Eval] Worker finished\n";
+}
+
+// Forward declaration of poll timer
+void eval_poll_timer(void* userdata);
+
+// Start evaluation from main/UI thread (this function is a safe callback)
+void start_evaluate_cb(Fl_Widget* w, void* userdata) {
+    if (g_eval_running.load()) {
+        std::cerr << "[Eval] Already running\n";
+        return;
+    }
+
+    // disable Evaluate/Sort/Save buttons on UI thread to avoid re-entry (userdata expects pointer array)
+    if (userdata) {
+        auto arr = static_cast<Fl_Widget**>(userdata);
+        if (arr[0]) arr[0]->deactivate(); // Evaluate
+        if (arr[1]) arr[1]->deactivate(); // Sort
+        if (arr[2]) arr[2]->deactivate(); // Save
+    }
+
+    g_eval_request_abort.store(false);
+    g_eval_done_flag.store(false);
+    g_eval_running.store(true);
+    g_eval_total_work.store(0);
+    g_eval_done_work.store(0);
+
+    // Start worker thread
+    g_eval_thread = std::thread([]() {
+        evaluate_worker_background();
+    });
+    g_eval_thread.detach();
+
+    // start poll timer to monitor worker
+    Fl::add_timeout(0.1, eval_poll_timer, userdata);
+}
+
+// Abort evaluation callback
+void abort_evaluation_cb(Fl_Widget* w, void* userdata) {
+    if (!g_eval_running.load()) return;
+    g_eval_request_abort.store(true);
+    std::cerr << "[Eval] Abort requested by user\n";
+}
+
+// -----------------------------------------------------------------------------
+// OpenGL visualization (points) - reads global g_bins under lock but copies data briefly
+// -----------------------------------------------------------------------------
+class LFSRView : public Fl_Gl_Window {
+    float cam_dist = 85000.0f;
+    float cam_pitch = 45.0f;
+    float cam_yaw = 0.0f;
+    float cam_x = 32768.0f;
+    float cam_y = 32768.0f;
+
+    int last_mx = 0, last_my = 0;
+    bool drag_rot = false, drag_pan = false;
+
+public:
+    LFSRView(int x, int y, int w, int h) : Fl_Gl_Window(x, y, w, h) {
+        mode(FL_RGB | FL_DOUBLE | FL_DEPTH | FL_MULTISAMPLE);
+    }
+
+    void draw() override {
+        if (!valid()) {
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glEnable(GL_POINT_SMOOTH);
+            glPointSize(2.0f);
+            glClearColor(0.1f, 0.1f, 0.15f, 1.0f);
+            glViewport(0, 0, w(), h());
+        }
+
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        gluPerspective(60.0, (double)w() / (h() > 0 ? h() : 1), 100.0, 300000.0);
+
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        glTranslatef(0.0f, 0.0f, -cam_dist);
+        glRotatef(cam_pitch, 1.0f, 0.0f, 0.0f);
+        glRotatef(cam_yaw, 0.0f, 1.0f, 0.0f);
+        glTranslatef(-cam_x, 0.0f, -cam_y);
+
+        // Draw Axes Box (0..65535)
+        glColor3f(0.3f, 0.3f, 0.3f);
+        glLineWidth(1.0f);
+        glBegin(GL_LINE_LOOP);
+        glVertex3f(0.0f, 0.0f, 0.0f); glVertex3f(65535.0f, 0.0f, 0.0f);
+        glVertex3f(65535.0f, 0.0f, 65535.0f); glVertex3f(0.0f, 0.0f, 65535.0f);
+        glEnd();
+
+        // Render Points by copying minimal data under lock to avoid long locks
+        struct DrawBin {
+            float r,g,b;
+            int id;
+            std::vector<Point2D> pts;
+        };
+        std::vector<DrawBin> drawbins;
+
+        {
+            std::lock_guard<std::mutex> lock(g_data_mutex);
+            for (const auto& bin : g_bins) {
+                if (!bin.visible || bin.points.empty()) continue;
+                DrawBin db;
+                db.r = bin.r; db.g = bin.g; db.b = bin.b;
+                db.id = bin.id;
+                // sample points if very many to keep drawing fast
+                size_t n = bin.points.size();
+                size_t step = 1;
+                if (n > 200000) step = n / 200000;
+                for (size_t i = 0; i < n; i += step) db.pts.push_back(bin.points[i]);
+                drawbins.push_back(std::move(db));
+            }
+        }
+
+        glBegin(GL_POINTS);
+        for (const auto &db : drawbins) {
+            glColor3f(db.r, db.g, db.b);
+            float height = static_cast<float>(db.id) / 255.0f * 15000.0f;
+            for (const auto &pt : db.pts) {
+                glVertex3f(static_cast<float>(pt.mask), height, static_cast<float>(pt.seed));
+            }
+        }
+        glEnd();
+
+        // selection crosshair
+        glColor4f(1.0f, 1.0f, 1.0f, 0.2f);
+        glBegin(GL_LINES);
+        glVertex3f(cam_x - 1000.0f, 0.0f, cam_y); glVertex3f(cam_x + 1000.0f, 0.0f, cam_y);
+        glVertex3f(cam_x, 0.0f, cam_y - 1000.0f); glVertex3f(cam_x, 0.0f, cam_y + 1000.0f);
+        glEnd();
+    }
+
+    int handle(int event) override {
+        switch (event) {
+            case FL_PUSH:
+                last_mx = Fl::event_x();
+                last_my = Fl::event_y();
+                if (Fl::event_button() == FL_LEFT_MOUSE) drag_rot = true;
+                if (Fl::event_button() == FL_RIGHT_MOUSE) drag_pan = true;
+                return 1;
+            case FL_RELEASE:
+                drag_rot = false;
+                drag_pan = false;
+                return 1;
+            case FL_DRAG: {
+                int dx = Fl::event_x() - last_mx;
+                int dy = Fl::event_y() - last_my;
+                last_mx = Fl::event_x();
+                last_my = Fl::event_y();
+
+                if (drag_rot) {
+                    cam_yaw += dx * 0.5f;
+                    cam_pitch += dy * 0.5f;
+                }
+                if (drag_pan) {
+                    float rad = cam_yaw * 3.14159265f / 180.0f;
+                    float c = std::cos(rad), s = std::sin(rad);
+                    cam_x -= (c * dx - s * dy) * (cam_dist * 0.001f);
+                    cam_y -= (s * dx + c * dy) * (cam_dist * 0.001f);
+                }
+                redraw();
+                return 1;
+            }
+            case FL_MOUSEWHEEL:
+                cam_dist -= Fl::event_dy() * (cam_dist * 0.1f);
+                if (cam_dist < 100.0f) cam_dist = 100.0f;
+                redraw();
+                return 1;
+            default:
+                return Fl_Gl_Window::handle(event);
+        }
+    }
+};
+
+// -----------------------------------------------------------------------------
+// Octagon sorting visualization widget (reads g_eval_by_bin under lock)
+// -----------------------------------------------------------------------------
+class OctagonSortView : public Fl_Gl_Window {
+    float cam_dist = 220000.0f;
+    float cam_pitch = 45.0f;
+    float cam_yaw = 0.0f;
+    float cam_x = 32768.0f;
+    float cam_y = 32768.0f;
+
+    int last_mx = 0, last_my = 0;
+    bool drag_rot = false, drag_pan = false;
+
+public:
+    OctagonSortView(int x, int y, int w, int h) : Fl_Gl_Window(x, y, w, h) {
+        mode(FL_RGB | FL_DOUBLE | FL_DEPTH | FL_MULTISAMPLE);
+    }
+
+    void draw_octagon_at(float cx, float cy, float cz, const EvalResult &er, float diameter, float rcol, float gcol, float bcol) {
+        // diameter is total desired diameter; per-vertex radius is scaled by section fraction
+        int max_section = 1;
+        for (int k = 0; k < 8; ++k) if (er.section_counts[k] > max_section) max_section = er.section_counts[k];
+        float radius_base = diameter * 0.5f;
+
+        glColor4f(rcol, gcol, bcol, 0.65f);
+        glBegin(GL_POLYGON);
+        for (int k = 0; k < 8; ++k) {
+            float ang = 2.0f * 3.14159265358979323846f * (float)k / 8.0f;
+            float frac = (max_section > 0) ? (static_cast<float>(er.section_counts[k]) / static_cast<float>(max_section)) : 0.0f;
+            // vertex radius ranges from 25% to 100% of base radius (keeps shape visible)
+            float vr = radius_base * (0.25f + 0.75f * frac);
+            float vx = cx + std::cos(ang) * vr;
+            float vz = cz + std::sin(ang) * vr;
+            glVertex3f(vx, cy, vz);
+        }
+        glEnd();
+
+        // outline
+        glColor4f(0.02f, 0.02f, 0.02f, 0.85f);
+        glLineWidth(1.0f);
+        glBegin(GL_LINE_LOOP);
+        for (int k = 0; k < 8; ++k) {
+            float ang = 2.0f * 3.14159265358979323846f * (float)k / 8.0f;
+            float frac = (max_section > 0) ? (static_cast<float>(er.section_counts[k]) / static_cast<float>(max_section)) : 0.0f;
+            float vr = radius_base * (0.25f + 0.75f * frac);
+            float vx = cx + std::cos(ang) * vr;
+            float vz = cz + std::sin(ang) * vr;
+            glVertex3f(vx, cy, vz);
+        }
+        glEnd();
+    }
+
+    void draw() override {
+        if (!valid()) {
+            glEnable(GL_DEPTH_TEST);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glEnable(GL_LINE_SMOOTH);
+            glPointSize(2.0f);
+            glClearColor(0.08f, 0.08f, 0.12f, 1.0f);
+            glViewport(0, 0, w(), h());
+        }
+
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        gluPerspective(60.0, (double)w() / (h() > 0 ? h() : 1), 100.0, 1000000.0);
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+        glTranslatef(0.0f, 0.0f, -cam_dist);
+        glRotatef(cam_pitch, 1.0f, 0.0f, 0.0f);
+        glRotatef(cam_yaw, 0.0f, 1.0f, 0.0f);
+        glTranslatef(-cam_x, 0.0f, -cam_y);
+
+        // grid reference
+        glColor3f(0.2f,0.2f,0.25f);
+        glBegin(GL_LINES);
+        for (int i=0;i<=65535;i+=8192) {
+            glVertex3f(static_cast<float>(i), 0.0f, 0.0f); glVertex3f(static_cast<float>(i), 0.0f, 65535.0f);
+            glVertex3f(0.0f, 0.0f, static_cast<float>(i)); glVertex3f(65535.0f, 0.0f, static_cast<float>(i));
+        }
+        glEnd();
+
+        // Collect evaluated bins & shallow-copy small structs under lock
+        struct BinCopy { int bin_id; std::vector<EvalResult> entries; };
+        std::vector<BinCopy> bins;
+        {
+            std::lock_guard<std::mutex> lock(g_data_mutex);
+            for (int b=0;b<256;++b) {
+                if (!g_eval_by_bin[b].empty()) {
+                    BinCopy bc;
+                    bc.bin_id = b;
+                    bc.entries = g_eval_by_bin[b]; // shallow copy of vector<struct> (not huge pointers)
+                    bins.push_back(std::move(bc));
+                }
+            }
+        }
+
+        if (bins.empty()) return;
+
+        // Layout bins into grid: columns ~ sqrt(nbins)
+        int nbins = static_cast<int>(bins.size());
+        int cols = static_cast<int>(std::ceil(std::sqrt((double)nbins)));
+        int rows = static_cast<int>(std::ceil((double)nbins / cols));
+        // World extents used for x and z layout: 0..65535
+        float world_size = 65535.0f;
+        float slot_w = world_size / static_cast<float>(cols);
+        float slot_z = world_size / static_cast<float>(rows);
+
+        // For each bin assign a slot (col,row) and inside the slot stack octagons vertically (Y)
+        for (int idx = 0; idx < nbins; ++idx) {
+            const auto &bc = bins[idx];
+            int col = idx % cols;
+            int row = idx / cols;
+            // center of slot in X/Z
+            float center_x = (col + 0.5f) * slot_w;
+            float center_z = (row + 0.5f) * slot_z;
+            // compute per-bin item spacing in world Y so that stack fits comfortably
+            int n = static_cast<int>(bc.entries.size());
+            if (n <= 0) continue;
+
+            // choose a slot height (in world Y) proportional to slot_z but clamped
+            // slot_z is available depth; we reuse it to derive a comfortable vertical region
+            float slot_height_world = std::min(200000.0f, slot_z * 0.9f); // cap to avoid insane sizes
+            // item spacing (center-to-center) -- if many entries, spacing shrinks
+            float item_spacing = slot_height_world / static_cast<float>(n);
+            // stack height by definition:
+            float stack_height = item_spacing * static_cast<float>(n);
+            // per your request: set octagon diameter equal to stack_height
+            float octagon_diameter = stack_height;
+            // center baseline Y so stack is centered around Y=0 (you can shift if desired)
+            float base_y = - (stack_height * 0.5f) + (item_spacing * 0.5f);
+
+            // Draw entries stacked vertically centered around base_y..base_y+stack_height
+            for (int e = 0; e < n; ++e) {
+                const EvalResult &er = bc.entries[e];
+                float cy = base_y + e * item_spacing;
+                // color
+                float rr=0,gg=0,bb=0;
+                get_color(er.bin_id, rr, gg, bb);
+                // draw octagon at (center_x, cy, center_z)
+                draw_octagon_at(center_x, cy, center_z, er, octagon_diameter, rr, gg, bb);
+            }
+        }
+    }
+
+    int handle(int event) override {
+        switch (event) {
+            case FL_PUSH:
+                last_mx = Fl::event_x();
+                last_my = Fl::event_y();
+                if (Fl::event_button() == FL_LEFT_MOUSE) drag_rot = true;
+                if (Fl::event_button() == FL_RIGHT_MOUSE) drag_pan = true;
+                return 1;
+            case FL_RELEASE:
+                drag_rot = false;
+                drag_pan = false;
+                return 1;
+            case FL_DRAG: {
+                int dx = Fl::event_x() - last_mx;
+                int dy = Fl::event_y() - last_my;
+                last_mx = Fl::event_x();
+                last_my = Fl::event_y();
+
+                if (drag_rot) {
+                    cam_yaw += dx * 0.5f;
+                    cam_pitch += dy * 0.5f;
+                }
+                if (drag_pan) {
+                    float rad = cam_yaw * 3.14159265f / 180.0f;
+                    float c = std::cos(rad), s = std::sin(rad);
+                    cam_x -= (c * dx - s * dy) * (cam_dist * 0.001f);
+                    cam_y -= (s * dx + c * dy) * (cam_dist * 0.001f);
+                }
+                redraw();
+                return 1;
+            }
+            case FL_MOUSEWHEEL:
+                cam_dist -= Fl::event_dy() * (cam_dist * 0.1f);
+                if (cam_dist < 100.0f) cam_dist = 100.0f;
+                redraw();
+                return 1;
+            default:
+                return Fl_Gl_Window::handle(event);
+        }
+    }
+};
+
+// -----------------------------------------------------------------------------
+// Bubble sort animation across evaluated bins (sorts each bin's vector in-place)
+// -----------------------------------------------------------------------------
+struct BubbleState {
+    int bin = 0;
+    size_t n = 0;
+    size_t i = 0;
+    size_t j = 0;
+    bool active = false;
+} g_bubble_state;
+
+void bubble_sort_timer(void*);
+
+// Start bubble sort (animated)
+void start_bubble_sort(Fl_Widget*, void*) {
+    if (g_sorting.load()) return;
+    // find first non-empty evaluated bin
+    std::lock_guard<std::mutex> lock(g_data_mutex);
+    g_bubble_state.active = false;
+    for (int b = 0; b < 256; ++b) {
+        if (!g_eval_by_bin[b].empty()) {
+            g_bubble_state.bin = b;
+            g_bubble_state.n = g_eval_by_bin[b].size();
+            g_bubble_state.i = 0;
+            g_bubble_state.j = 0;
+            g_bubble_state.active = true;
+            break;
+        }
+    }
+    if (!g_bubble_state.active) {
+        std::cerr << "[Sort] No evaluated bins to sort\n";
+        return;
+    }
+    g_sorting = true;
+    g_stop_sort = false;
+    Fl::add_timeout(0.01, bubble_sort_timer, nullptr);
+    std::cerr << "[Sort] Started\n";
+}
+
+void stop_bubble_sort(Fl_Widget*, void*) {
+    if (!g_sorting.load()) return;
+    g_stop_sort = true;
+}
+
+// Bubble sort timer: small number of comparisons per tick
+void bubble_sort_timer(void*) {
+    if (!g_sorting.load()) return;
+    if (g_stop_sort.load()) {
+        g_sorting = false;
+        std::cerr << "[Sort] Stopped by user\n";
+        return;
+    }
+
+    const size_t K = 512;
+    size_t performed = 0;
+    bool any_active = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_data_mutex);
+        while (performed < K && g_bubble_state.active) {
+            auto &vec = g_eval_by_bin[g_bubble_state.bin];
+            if (vec.size() < 2) {
+                // move to next non-empty bin
+                bool found = false;
+                for (int b = g_bubble_state.bin + 1; b < 256; ++b) {
+                    if (!g_eval_by_bin[b].empty()) {
+                        g_bubble_state.bin = b;
+                        g_bubble_state.n = g_eval_by_bin[b].size();
+                        g_bubble_state.i = 0;
+                        g_bubble_state.j = 0;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) { g_bubble_state.active = false; break; }
+                continue;
+            }
+
+            if (g_bubble_state.i >= vec.size() - 1) {
+                // finished this bin -> next bin
+                bool found = false;
+                for (int b = g_bubble_state.bin + 1; b < 256; ++b) {
+                    if (!g_eval_by_bin[b].empty()) {
+                        g_bubble_state.bin = b;
+                        g_bubble_state.n = g_eval_by_bin[b].size();
+                        g_bubble_state.i = 0;
+                        g_bubble_state.j = 0;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) { g_bubble_state.active = false; break; }
+                continue;
+            }
+
+            size_t n = vec.size();
+            if (g_bubble_state.j >= n - g_bubble_state.i - 1) {
+                g_bubble_state.i++;
+                g_bubble_state.j = 0;
+                continue;
+            }
+
+            double a = vec[g_bubble_state.j].symmetry_score;
+            double bscore = vec[g_bubble_state.j+1].symmetry_score;
+            if (a > bscore) {
+                std::swap(vec[g_bubble_state.j], vec[g_bubble_state.j+1]);
+            }
+            g_bubble_state.j++;
+            performed++;
+            any_active = true;
+        }
+    }
+
+    if (any_active) {
+        // request redraw (on UI thread)
+        Fl::awake([](void*){
+            Fl::flush();
+        });
+        Fl::repeat_timeout(0.01, bubble_sort_timer, nullptr);
+    } else {
+        g_sorting = false;
+        std::cerr << "[Sort] Completed\n";
+    }
+}
+
+// Save the sorted order back into g_bins and to disk
+void save_sorted_results_to_files() {
+    std::lock_guard<std::mutex> lock(g_data_mutex);
+    for (int b = 0; b < 256; ++b) {
+        if (g_eval_by_bin[b].empty()) continue;
+        if (g_bins[b].points.size() != g_eval_by_bin[b].size()) {
+            std::cerr << "[SaveSorted] size mismatch for bin " << b << " skipping\n";
+            continue;
+        }
+        for (size_t i = 0; i < g_eval_by_bin[b].size(); ++i) {
+            g_bins[b].points[i] = g_eval_by_bin[b][i].p;
+        }
+    }
+    save_all_bins();
+}
+
+// on exit save
+void on_exit_save() {
+    std::cerr << "[Exit] Saving data on exit...\n";
+    save_sorted_results_to_files();
+}
+
+// -----------------------------------------------------------------------------
+// UI Wiring
+// -----------------------------------------------------------------------------
+Fl_Check_Browser* browser = nullptr;
+LFSRView* gl_view = nullptr;
+OctagonSortView* sort_view = nullptr;
+Fl_Box* stat_box = nullptr;
+Fl_Button* btn_eval = nullptr;
+Fl_Button* btn_sort = nullptr;
+Fl_Button* btn_save = nullptr;
+Fl_Button* btn_abort = nullptr;
+
+// browser callback
+void browser_cb(Fl_Widget*, void*) {
+    for (int i = 0; i < 256; ++i) {
+        bool checked = browser->checked(i + 1);
+        if (checked && !g_bins[i].visible) {
+            load_bin(i);
+            g_bins[i].visible = !g_bins[i].points.empty();
+        } else if (!checked && g_bins[i].visible) {
+            unload_bin(i);
+        }
+    }
+    update_stats();
+    if (stat_box) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "Visible Bins: %d\nTotal Points: %zu",
+                      g_stats.visible_bins, g_stats.total_points);
+        stat_box->copy_label(buf);
+    }
+    if (gl_view) gl_view->redraw();
+}
+
+// select all / clear
+void select_all_cb(Fl_Widget*, void*) {
+    for (int i = 1; i <= 256; ++i) browser->checked(i, 1);
+    browser_cb(nullptr, nullptr);
+}
+void clear_all_cb(Fl_Widget*, void*) {
+    for (int i = 1; i <= 256; ++i) browser->checked(i, 0);
+    browser_cb(nullptr, nullptr);
+}
+
+// Save now callback
+void save_now_cb(Fl_Widget*, void*) {
+    save_sorted_results_to_files();
+}
+
+// -----------------------------------------------------------------------------
+// Poll timer implementation
+// -----------------------------------------------------------------------------
+void eval_poll_timer(void* userdata) {
+    Fl_Widget** btns = static_cast<Fl_Widget**>(userdata);
+
+    if (g_eval_running.load()) {
+        // still running -> update coarse progress and reschedule
+        size_t total = g_eval_total_work.load();
+        size_t done = g_eval_done_work.load();
+        if (btns && btns[3]) {
+            Fl_Box* stat = static_cast<Fl_Box*>(btns[3]);
+            char buf[256];
+            if (total > 0) {
+                double pct = (100.0 * (double)done) / (double)total;
+                std::snprintf(buf, sizeof(buf), "Evaluating... %.2f%% (%zu/%zu)", pct, done, total);
+            } else {
+                std::snprintf(buf, sizeof(buf), "Evaluating...");
+            }
+            stat->copy_label(buf);
+        }
+        // reschedule
+        Fl::repeat_timeout(0.1, eval_poll_timer, userdata);
+        return;
+    }
+
+    // finished -> update UI, re-enable buttons, redraw
+    update_stats();
+    if (btns && btns[3]) {
+        Fl_Box* stat = static_cast<Fl_Box*>(btns[3]);
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "Finished evaluation\nVisible Bins: %d\nTotal Points: %zu",
+                      static_cast<int>(g_stats.visible_bins), g_stats.total_points);
+        stat->copy_label(buf);
+    }
+
+    if (btns) {
+        if (btns[0]) btns[0]->activate(); // Evaluate
+        if (btns[1]) btns[1]->activate(); // Sort
+        if (btns[2]) btns[2]->activate(); // Save
+    }
+
+    if (gl_view) gl_view->redraw();
+    if (sort_view) sort_view->redraw();
+}
+
+// -----------------------------------------------------------------------------
+// Main
+// -----------------------------------------------------------------------------
+int main(int argc, char **argv) {
+    std::atexit(on_exit_save);
+
+    Fl_Double_Window* win = new Fl_Double_Window(1280, 720, "LFSR Analytical Visualizer (FLTK/OpenGL)");
+
+    // Tabs
+    Fl_Tabs* tabs = new Fl_Tabs(10, 10, 1260, 700);
+
+    Fl_Group* grp1 = new Fl_Group(10, 35, 1240, 645, "Point Cloud");
+    grp1->begin();
+    gl_view = new LFSRView(10, 35, 980, 660);
+    grp1->end();
+
+    Fl_Group* grp2 = new Fl_Group(10, 35, 1240, 645, "Octagon Sorting");
+    grp2->begin();
+    sort_view = new OctagonSortView(10, 35, 980, 660);
+    grp2->end();
+
+    tabs->end();
+
+    // Controls
+    Fl_Group* controls = new Fl_Group(1000, 10, 270, 700);
+    controls->begin();
+
+    browser = new Fl_Check_Browser(1000, 10, 270, 320, "PWM Bins (0x00 - 0xFF)");
+    for (int i = 0; i < 256; ++i) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "Bin 0x%02X (%d)", i, i);
+        browser->add(buf);
+    }
+    browser->callback(browser_cb);
+    browser->when(FL_WHEN_CHANGED);
+
+    Fl_Button* btn_all = new Fl_Button(1000, 340, 130, 25, "Select All");
+    btn_all->callback(select_all_cb);
+    Fl_Button* btn_none = new Fl_Button(1140, 340, 130, 25, "Clear");
+    btn_none->callback(clear_all_cb);
+
+    // Buttons: Evaluate, Sort, Stop Sort, Abort, Save
+    btn_eval = new Fl_Button(1000, 370, 130, 30, "Evaluate");
+    btn_sort = new Fl_Button(1140, 370, 130, 30, "Sort (Bubble)");
+    Fl_Button* btn_stop = new Fl_Button(1000, 410, 130, 30, "Stop Sort");
+    btn_save = new Fl_Button(1140, 410, 130, 30, "Save");
+    btn_abort = new Fl_Button(1000, 450, 270, 30, "Abort Eval");
+
+    // Prepare userdata array to pass pointers to start_evaluate_cb polling code:
+    // arr[0] = Evaluate, arr[1] = Sort, arr[2] = Save, arr[3] = stat_box (set later)
+    Fl_Widget** userdata = new Fl_Widget*[4];
+    userdata[0] = btn_eval;
+    userdata[1] = btn_sort;
+    userdata[2] = btn_save;
+    userdata[3] = nullptr; // stat_box pointer assigned after creation
+
+    btn_eval->callback(start_evaluate_cb, userdata);
+    btn_sort->callback(start_bubble_sort);
+    btn_stop->callback(stop_bubble_sort);
+    btn_save->callback(save_now_cb);
+    btn_abort->callback(abort_evaluation_cb);
+
+    Fl_Box* stat_panel = new Fl_Box(1000, 490, 270, 200);
+    stat_panel->box(FL_DOWN_BOX);
+    stat_panel->color(fl_rgb_color(220, 220, 220));
+
+    stat_box = new Fl_Box(1010, 500, 250, 180, "Select bins to view stats...");
+    stat_box->align(FL_ALIGN_TOP_LEFT | FL_ALIGN_INSIDE);
+    stat_box->labelfont(FL_COURIER);
+
+    // pass stat_box into userdata so the poller can update it
+    userdata[3] = stat_box;
+
+    controls->end();
+
+    win->end();
+    win->resizable(gl_view);
+    win->show(argc, argv);
+
+    // initial stats display
+    update_stats();
+    if (stat_box) {
+        char buf[256];
+        std::snprintf(buf, sizeof(buf), "Visible Bins: %d\nTotal Points: %zu",
+                      g_stats.visible_bins, g_stats.total_points);
+        stat_box->copy_label(buf);
+    }
+
+    return Fl::run();
+}
