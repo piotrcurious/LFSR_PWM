@@ -206,6 +206,7 @@ struct Options {
     double lc_weight = 0.01;
     double period_weight = 0.001;
     double spectral_weight = 10.0;
+    double global_error_weight = 1.0;
     unsigned seed = 0;
     int min_taps = 1;  // Minimum number of taps (bits set in mask)
     double min_period_ratio = 0.0; // skip cycles shorter than ratio * (1<<n)
@@ -233,6 +234,7 @@ Options parse_args(int argc, char **argv) {
         {"lc-weight", required_argument, nullptr, 'l'},
         {"period-weight", required_argument, nullptr, 'p'},
         {"spectral-weight", required_argument, nullptr, 'S'},
+        {"global-error-weight", required_argument, nullptr, 'g'},
         {"seed", required_argument, nullptr, 's'},
         {"min-taps", required_argument, nullptr, 'T'},
         {"min-period-ratio", required_argument, nullptr, 'q'},
@@ -258,6 +260,7 @@ Options parse_args(int argc, char **argv) {
             case 'l': opt.lc_weight = std::stod(optarg); break;
             case 'p': opt.period_weight = std::stod(optarg); break;
             case 'S': opt.spectral_weight = std::stod(optarg); break;
+            case 'g': opt.global_error_weight = std::stod(optarg); break;
             case 's': opt.seed = (unsigned)std::stoul(optarg); break;
             case 'T': opt.min_taps = std::atoi(optarg); break;
             case 'q': opt.min_period_ratio = std::stod(optarg); break;
@@ -410,7 +413,7 @@ void evaluate_mask_for_all_levels(u64 mask, int n, const std::vector<double> &ta
                                   std::vector<LFSRConfig> &best_configs,
                                   std::vector<uint32_t> &candidate_counts,
                                   std::mutex &merge_mutex, double lc_weight,
-                                  double period_weight, double spectral_weight, double min_period_ratio,
+                                  double period_weight, double spectral_weight, double global_error_weight, double min_period_ratio,
                                   int min_sample_bits, int max_sample_bits,
                                   int block_size, double max_block_error,
                                   int resolution, bool export_bins_flag) {
@@ -627,7 +630,7 @@ void evaluate_mask_for_all_levels(u64 mask, int n, const std::vector<double> &ta
                 double lc_bonus = lc_weight * lc_term;
                 double period_bonus = period_weight * period_term;
                 double spectral_penalty = spectral_weight * lf_energy;
-                double score = max_block_error_seen - lc_bonus - period_bonus + spectral_penalty; // use block-based error in score
+                double score = (max_block_error_seen) + (global_error_weight * error) - lc_bonus - period_bonus + spectral_penalty; // use block-based error in score
 
                 if (score + EPS < local_configs[ti].score) {
                     local_configs[ti].mask = mask;
@@ -756,7 +759,7 @@ int main(int argc, char **argv) {
     std::cerr << "LFSR PWM Threshold Search (improved, circular sliding-window, export)\n";
     std::cerr << "n=" << opt.n << " bits, resolution=" << opt.resolution
               << ", threads=" << opt.threads << "\n";
-    std::cerr << "LC weight=" << opt.lc_weight << ", period weight=" << opt.period_weight << ", spectral weight=" << opt.spectral_weight << "\n";
+    std::cerr << "LC weight=" << opt.lc_weight << ", period weight=" << opt.period_weight << ", spectral weight=" << opt.spectral_weight << ", global error weight=" << opt.global_error_weight << "\n";
     std::cerr << "Min taps=" << opt.min_taps << ", min_period_ratio=" << opt.min_period_ratio << "\n";
     std::cerr << "Block-size=" << opt.block_size << " steps, max-block-error=" << opt.max_block_error << "\n";
     std::cerr << "Export bins: " << (opt.export_bins ? "ENABLED" : "DISABLED") << " (out_dir=" << opt.out_dir << ")\n";
@@ -808,7 +811,7 @@ int main(int argc, char **argv) {
             evaluate_mask_for_all_levels(masks[i], opt.n, targets, best_configs,
                                          candidate_counts,
                                          merge_mutex, opt.lc_weight, opt.period_weight,
-                                         opt.spectral_weight, opt.min_period_ratio,
+                                         opt.spectral_weight, opt.global_error_weight, opt.min_period_ratio,
                                          opt.min_sample_bits, max_sample_bits_cap,
                                          opt.block_size, opt.max_block_error, opt.resolution,
                                          opt.export_bins);

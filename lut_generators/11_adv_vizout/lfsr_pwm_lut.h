@@ -11,7 +11,7 @@
 #endif
 
 const struct { uint16_t mask; uint16_t seed; } lfsr_pwm_lut[] PROGMEM = {
-  { 0x0119u, 0x03feu }, // 000: duty=0.0010 err=3.91e-03 P=1023 LC=343 LF=4.78e-06
+  { 0x0347u, 0x03feu }, // 000: duty=0.0010 err=3.91e-03 P=1023 LC=343 LF=4.78e-06
   { 0x001bu, 0x03fbu }, // 001: duty=0.0039 err=1.17e-02 P=1023 LC=673 LF=6.53e-05
   { 0x02fdu, 0x03f7u }, // 002: duty=0.0078 err=2.34e-02 P=1023 LC=676 LF=1.15e-04
   { 0x02b5u, 0x03f3u }, // 003: duty=0.0117 err=2.73e-02 P=1023 LC=620 LF=1.27e-04
@@ -266,7 +266,7 @@ const struct { uint16_t mask; uint16_t seed; } lfsr_pwm_lut[] PROGMEM = {
   { 0x010du, 0x000cu }, // 252: duty=0.9883 err=2.34e-02 P=1023 LC=581 LF=1.08e-04
   { 0x01e5u, 0x0008u }, // 253: duty=0.9922 err=1.17e-02 P=1023 LC=669 LF=6.23e-05
   { 0x0065u, 0x0004u }, // 254: duty=0.9961 err=3.92e-03 P=1023 LC=672 LF=1.93e-05
-  { 0x0119u, 0x0001u }, // 255: duty=0.9990 err=3.91e-03 P=1023 LC=343 LF=4.78e-06
+  { 0x0339u, 0x0001u }, // 255: duty=0.9990 err=3.91e-03 P=1023 LC=343 LF=4.78e-06
 };
 
 /* Example Arduino usage:

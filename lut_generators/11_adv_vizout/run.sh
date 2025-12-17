@@ -1,2 +1,2 @@
 #!/bin/bash
-./adv_vizout_spectral_01 --n 10 --res 256 --max-masks 1000 --spectral-weight 20.0 --no-export-bins
+./adv_vizout_spectral_01 --n 10 --res 256 --max-masks 1000 --spectral-weight 20.0 --global-error-weight 100.0 --no-export-bins
