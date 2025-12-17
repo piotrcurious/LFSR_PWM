@@ -11,7 +11,7 @@
 #endif
 
 const struct { uint16_t mask; uint16_t seed; } lfsr_pwm_lut[] PROGMEM = {
-  { 0x0347u, 0x03feu }, // 000: duty=0.0010 err=3.91e-03 P=1023 LC=343 LF=4.78e-06
+  { 0x016bu, 0x03feu }, // 000: duty=0.0010 err=3.91e-03 P=1023 LC=343 LF=4.78e-06
   { 0x001bu, 0x03fbu }, // 001: duty=0.0039 err=1.17e-02 P=1023 LC=673 LF=6.53e-05
   { 0x02fdu, 0x03f7u }, // 002: duty=0.0078 err=2.34e-02 P=1023 LC=676 LF=1.15e-04
   { 0x02b5u, 0x03f3u }, // 003: duty=0.0117 err=2.73e-02 P=1023 LC=620 LF=1.27e-04
@@ -43,7 +43,7 @@ const struct { uint16_t mask; uint16_t seed; } lfsr_pwm_lut[] PROGMEM = {
   { 0x031du, 0x038bu }, // 029: duty=0.1134 err=3.56e-02 P=1023 LC=512 LF=4.14e-04
   { 0x031du, 0x0387u }, // 030: duty=0.1173 err=3.17e-02 P=1023 LC=512 LF=4.98e-04
   { 0x0237u, 0x0383u }, // 031: duty=0.1212 err=3.47e-02 P=1023 LC=511 LF=5.14e-04
-  { 0x0201u, 0x037eu }, // 032: duty=0.1260 err=2.39e-02 P=889 LC=445 LF=7.31e-05
+  { 0x01c7u, 0x037fu }, // 032: duty=0.1251 err=3.86e-02 P=1023 LC=175 LF=4.45e-04
   { 0x0237u, 0x037bu }, // 033: duty=0.1290 err=3.47e-02 P=1023 LC=512 LF=5.19e-04
   { 0x0237u, 0x0377u }, // 034: duty=0.1329 err=3.18e-02 P=1023 LC=512 LF=4.28e-04
   { 0x0237u, 0x0373u }, // 035: duty=0.1369 err=3.46e-02 P=1023 LC=512 LF=4.49e-04
@@ -266,7 +266,7 @@ const struct { uint16_t mask; uint16_t seed; } lfsr_pwm_lut[] PROGMEM = {
   { 0x010du, 0x000cu }, // 252: duty=0.9883 err=2.34e-02 P=1023 LC=581 LF=1.08e-04
   { 0x01e5u, 0x0008u }, // 253: duty=0.9922 err=1.17e-02 P=1023 LC=669 LF=6.23e-05
   { 0x0065u, 0x0004u }, // 254: duty=0.9961 err=3.92e-03 P=1023 LC=672 LF=1.93e-05
-  { 0x0339u, 0x0001u }, // 255: duty=0.9990 err=3.91e-03 P=1023 LC=343 LF=4.78e-06
+  { 0x010du, 0x0001u }, // 255: duty=0.9990 err=3.91e-03 P=1023 LC=343 LF=4.78e-06
 };
 
 /* Example Arduino usage:

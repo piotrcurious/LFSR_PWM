@@ -419,7 +419,11 @@ void evaluate_mask_for_all_levels(u64 mask, int n, const std::vector<double> &ta
                                   int resolution, bool export_bins_flag) {
     // Find cycles
     std::vector<std::vector<u64>> cycles = find_all_cycles_raw(mask, n);
-    if (cycles.empty()) return;
+    // We are only interested in masks that generate a single, maximal-length cycle (plus the trivial zero cycle, which is ignored by find_all_cycles_raw).
+    // Multiple cycles indicate a non-periodic LFSR that is unsuitable for high-quality PWM.
+    if (cycles.size() != 1) {
+        return;
+    }
 
     // Thread-local LC cache
     static thread_local std::unordered_map<uint64_t, int> lc_cache;
