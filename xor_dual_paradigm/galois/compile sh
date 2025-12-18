@@ -1,0 +1,1 @@
+g++ -O3 -march=native -std=c++17 -pthread -o lutgen_full lutgen_full.cpp
