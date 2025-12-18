@@ -1,0 +1,1 @@
+./lutgen_full --regenerate --out-cache masks_cache.bin --threads 12 --sample-seeds 128
